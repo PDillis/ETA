@@ -12,6 +12,64 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 
+############################################################
+# Waypoint projection & mask generation (ported from ETA visutils.py)
+############################################################
+
+def project_waypoints_to_pixels(waypoints, config):
+    """Project ego-frame waypoints [N,2] (forward, lateral) to front camera pixels [N,2]."""
+    K = np.array([
+        [config.camera_focal_length, 0.0, config.camera_cx],
+        [0.0, config.camera_focal_length, config.camera_cy],
+        [0.0, 0.0, 1.0],
+    ])
+    # ETA convention: ego frame [x_forward, y_lateral] → camera frame [y_lateral, height, x_forward]
+    # Negate lateral per ETA data.py:532 (CARLA positive-y = left)
+    points_cam = np.stack([
+        -waypoints[:, 1],                                    # lateral → camera x (negated)
+        np.full(len(waypoints), config.camera_height),       # fixed height
+        waypoints[:, 0],                                     # forward → camera z (depth)
+    ], axis=-1)
+
+    # Guard against zero/negative depth
+    depth = points_cam[:, 2:3].copy()
+    mask = np.abs(depth) < 1e-4
+    depth[mask] = 1e-4
+    points_cam = points_cam / depth
+
+    pixel = (K @ points_cam.T).T
+    pixel = -pixel
+    pixel[:, 0] += config.camera_original_size[0] // 2
+    pixel[:, 1] += config.camera_original_size[1] // 2
+    return pixel[:, :2]
+
+
+def generate_waypoint_mask(waypoints, config):
+    """Generate low-res binary mask [mask_height, mask_width] from ego-frame waypoints [N,2]."""
+    # Filter out waypoints behind camera (forward distance <= 0)
+    valid = waypoints[:, 0] > 0.5
+    if not np.any(valid):
+        return np.zeros((config.mask_height, config.mask_width), dtype=np.float32)
+
+    pixel_coords = project_waypoints_to_pixels(waypoints[valid], config)
+
+    orig_w, orig_h = config.camera_original_size
+    scale_x = config.mask_width / orig_w
+    scale_y = config.mask_height / orig_h
+
+    mask = np.zeros((config.mask_height, config.mask_width), dtype=np.float32)
+    r = config.mask_waypoint_radius
+    for px, py in zip(pixel_coords[:, 0] * scale_x, pixel_coords[:, 1] * scale_y):
+        ix, iy = int(round(px)), int(round(py))
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if dx * dx + dy * dy <= r * r:
+                    ny, nx = iy + dy, ix + dx
+                    if 0 <= ny < config.mask_height and 0 <= nx < config.mask_width:
+                        mask[ny, nx] = 1.0
+    return mask
+
+
 class CARLA_Data(Dataset):
     """
     Bench2Drive → CIL++ dataset.
@@ -118,6 +176,28 @@ class CARLA_Data(Dataset):
         self.action_index += data['action_index']
         self.only_ap_brake += data['only_ap_brake']
 
+        # Bucket vectors for weighted sampling (optional — backward compatible)
+        self.buckets = None
+        if 'buckets' in data:
+            self.buckets = np.array(data['buckets'], dtype=np.float64)
+
+    def get_sample_weights(self):
+        """Compute per-sample weights from bucket vectors. Returns (N,) float32 array."""
+        if self.buckets is None:
+            raise ValueError("No bucket data available. Regenerate .npy with bucket support.")
+        buckets = self.buckets
+        col_sums = buckets.sum(axis=0)
+        col_sums[col_sums == 0] = 1.0
+        normalized = buckets / col_sums
+
+        if self.config.bucket_weight_type == 'uniform':
+            return normalized.mean(axis=-1).astype(np.float32)
+        elif self.config.bucket_weight_type == 'preferturns':
+            bw = np.array(self.config.bucket_weights)
+            return ((normalized * bw).sum(axis=-1) / bw.sum()).astype(np.float32)
+        else:
+            raise ValueError(f"Unknown bucket_weight_type: {self.config.bucket_weight_type}")
+
     def load_image(self, img_path):
         """Load all configured camera views for a given reference image path into the cache."""
         for cam_name in self.data_used:
@@ -169,6 +249,11 @@ class CARLA_Data(Dataset):
             waypoints.append([local_command_point[0], local_command_point[1]])
 
         data['waypoints'] = np.array(waypoints)
+
+        if getattr(self.config, 'mask_loss_enabled', False):
+            data['waypoint_mask'] = torch.from_numpy(
+                generate_waypoint_mask(data['waypoints'], self.config)
+            )
 
         data['action'] = self.action[index]
         data['action_index'] = self.action_index[index]

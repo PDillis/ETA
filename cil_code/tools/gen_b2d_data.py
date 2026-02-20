@@ -70,6 +70,151 @@ def make_output_name(name: str, output_fps: int, input_frames: int, future_frame
     return f"{name}_{output_fps}Hz_{input_frames}Input_{future_frames}Future-{split}.npy"
 
 
+############################################################
+# Hazard helpers (ported from ETA: carformer/data/data_utils.py)
+############################################################
+
+def _orientation(yaw):
+    return np.float32([np.cos(np.radians(yaw)), np.sin(np.radians(yaw))])
+
+
+def get_collision(p1, v1, p2, v2):
+    A = np.stack([v1, -v2], 1)
+    b = p2 - p1
+    if abs(np.linalg.det(A)) < 1e-3:
+        return False, None
+    x = np.linalg.solve(A, b)
+    collides = all(x >= 0) and all(x <= 4)  # collision within 4 seconds
+    return collides, p1 + x[0] * v1
+
+
+def get_hazard_directions(vehicle_list):
+    """Return list of angle_from_ego for nearby vehicle hazards."""
+    ego_vehicles = [x for x in vehicle_list if x["class"] == "ego_vehicle"]
+    if len(ego_vehicles) != 1:
+        return []
+
+    ego_vehicle = ego_vehicles[0]
+    o1 = _orientation(ego_vehicle["rotation"][-1])
+    p1 = np.asarray(ego_vehicle["location"][:2])
+    s1 = max(2, 3.0 * ego_vehicle["speed"])
+    v1_hat = o1
+
+    hazard_directions = []
+    for target_vehicle in vehicle_list:
+        if target_vehicle["class"] == "ego_vehicle":
+            continue
+        if target_vehicle.get("base_type", None) != "car":
+            continue
+
+        o2 = _orientation(target_vehicle["rotation"][-1])
+        p2 = np.asarray(target_vehicle["location"][:2])
+
+        p2_p1 = p2 - p1
+        distance = np.linalg.norm(p2_p1)
+        p2_p1_hat = p2_p1 / (distance + 1e-4)
+
+        angle_to_car = np.degrees(np.arccos(np.clip(v1_hat.dot(p2_p1_hat), -1, 1)))
+        angle_between_heading = np.degrees(np.arccos(np.clip(o1.dot(o2), -1, 1)))
+        angle_from_ego = np.degrees(np.arccos(np.clip(o2.dot(p2_p1_hat), -1, 1)))
+
+        angle_to_car = min(angle_to_car, 360.0 - angle_to_car)
+        angle_between_heading = min(angle_between_heading, 360.0 - angle_between_heading)
+
+        if angle_between_heading > 60.0 and not (angle_to_car < 15 and distance < s1):
+            continue
+        elif angle_to_car > 30.0:
+            continue
+        elif distance > s1:
+            continue
+
+        hazard_directions.append(angle_from_ego)
+
+    return hazard_directions
+
+
+def is_walker_hazard(objects_list):
+    """Return True if any walker is on a collision course with ego within 4 seconds."""
+    ego_vehicles = [x for x in objects_list if x["class"] == "ego_vehicle"]
+    if len(ego_vehicles) == 0:
+        return False
+
+    ego_vehicle = ego_vehicles[0]
+    p1 = np.asarray(ego_vehicle["location"][:2])
+    v1 = 10.0 * _orientation(ego_vehicle["rotation"][-1])
+
+    walkers = [x for x in objects_list if x["class"] == "walker"]
+    for walker in walkers:
+        v2_hat = _orientation(walker["rotation"][-1])
+        s2 = walker["speed"]
+        if s2 < 0.05:
+            v2_hat *= s2
+        p2 = -3.0 * v2_hat + np.asarray(walker["location"][:2])
+        v2 = 8.0 * v2_hat
+        collides, _ = get_collision(p1, v1, p2, v2)
+        if collides:
+            return True
+    return False
+
+
+############################################################
+# Data bucketing (ported from ETA: carformer/data/data_parser.py)
+############################################################
+
+BUCKET_NAMES = [
+    'general', 'acc_scratch', 'acc_light_pedal', 'acc_medium_pedal',
+    'acc_heavy_pedal', 'acc_brake', 'acc_coast', 'steer_right', 'steer_left',
+    'vehicle_hazard_front', 'vehicle_hazard_back', 'vehicle_hazard_side',
+    'stop_sign', 'red_light', 'swerving', 'pedestrian',
+]
+
+SWERVING_SCENARIOS = [
+    "Accident", "BlockedIntersection", "ConstructionObstacle",
+    "HazardAtSideLane", "ParkedObstacle", "VehicleOpensDoorTwoWays",
+]
+
+
+def compute_buckets(throttle, steer, brake, speed, bounding_boxes, route_name):
+    """Compute 16-element binary bucket vector for a single sample."""
+    # Acceleration buckets (thresholds from ETA data_parser.py)
+    acc_bucket = [
+        1 if (throttle > 0.2 and brake < 1.0 and speed < 0.05) else 0,  # scratch
+        1 if (throttle > 0.2 and throttle < 0.5) else 0,                # light pedal
+        1 if (throttle > 0.5 and throttle < 0.9) else 0,                # medium pedal
+        1 if (throttle > 0.9) else 0,                                    # heavy pedal
+        1 if (brake > 0.2) else 0,                                       # brake
+        1 if (throttle < 0.2 and brake < 1.0) else 0,                   # coast
+    ]
+    steer_bucket = [1 if steer > 0.2 else 0, 1 if steer < -0.2 else 0]
+
+    # Vehicle hazard (from bounding_boxes)
+    hazard_angles = get_hazard_directions(bounding_boxes)
+    veh_bucket = [
+        1 if any(a < 30 for a in hazard_angles) else 0,       # front
+        1 if any(a > 150 for a in hazard_angles) else 0,      # back
+        1 if any(30 < a < 150 for a in hazard_angles) else 0, # side
+    ]
+
+    # Stop sign
+    stopsigns = [x for x in bounding_boxes
+                 if x.get("class") == "traffic_sign" and x.get("type_id") == "traffic.stop"]
+    stop_bucket = 1 if any(x.get("affects_ego", False) for x in stopsigns) else 0
+
+    # Red light
+    redlights = [x for x in bounding_boxes
+                 if x.get("class") == "traffic_light" and x.get("state") == 0]
+    red_bucket = 1 if any(x.get("affects_ego", False) for x in redlights) else 0
+
+    # Swerving
+    is_swerving_route = any(s in route_name for s in SWERVING_SCENARIOS)
+    swerve_bucket = 1 if (is_swerving_route and abs(steer) > 0.1) else 0
+
+    # Pedestrian
+    ped_bucket = 1 if is_walker_hazard(bounding_boxes) else 0
+
+    return [1] + acc_bucket + steer_bucket + veh_bucket + [stop_bucket, red_bucket, swerve_bucket, ped_bucket]
+
+
 def _all_finite(*xs) -> bool:
     """Check if all values are finite (no NaN/Inf)."""
     for x in xs:
@@ -134,6 +279,7 @@ def process_single_route(
     seq_only_ap_brake = []
     seq_acceleration = []
     seq_angular_velocity = []
+    seq_buckets = []
 
     # Full sequences (for downsampling)
     full_seq_x, full_seq_y, full_seq_theta = [], [], []
@@ -260,6 +406,11 @@ def process_single_route(
         seq_acceleration.append(cur_accel)
         seq_angular_velocity.append(cur_ang_vel)
 
+        # Bucket computation
+        bounding_boxes = anno.get('bounding_boxes', [])
+        bucket = compute_buckets(throttle, steer, brake, cur_speed, bounding_boxes, basename)
+        seq_buckets.append(bucket)
+
     with count.get_lock():
         count.value += 1
 
@@ -296,6 +447,7 @@ def process_single_route(
         'only_ap_brake': seq_only_ap_brake,
         'acceleration': seq_acceleration,
         'angular_velocity': seq_angular_velocity,
+        'buckets': seq_buckets,
         'skipped_nan': _skipped_nan,
     }
 
@@ -394,6 +546,7 @@ def aggregate_and_save(seq_data_list: List[Dict], output_path: str):
         'only_ap_brake': [],
         'acceleration': [],
         'angular_velocity': [],
+        'buckets': [],
     }
 
     _skipped_nan_total = 0
@@ -407,6 +560,7 @@ def aggregate_and_save(seq_data_list: List[Dict], output_path: str):
         for key in total_data.keys():
             total_data[key].extend(seq_data[key])
 
+    total_data['bucket_names'] = BUCKET_NAMES
     np.save(output_path, total_data)
     console.print(f'[green]Saved {len(total_data["front_img"])} sequences to {output_path}[/green]')
     console.print(f'[yellow]Total sequences skipped due to NaN/Inf: {_skipped_nan_total}[/yellow]')

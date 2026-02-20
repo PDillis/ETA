@@ -105,6 +105,18 @@ class CILpp(nn.Module):
             }
         )
 
+        # Mask prediction head (optional auxiliary task)
+        self.mask_head = None
+        if getattr(config, 'mask_loss_enabled', False):
+            mask_size = config.mask_height * config.mask_width
+            self.mask_head = nn.Sequential(
+                nn.Linear(self.d_model, 256),
+                nn.ReLU(),
+                nn.Linear(256, mask_size),
+            )
+            self._mask_h = config.mask_height
+            self._mask_w = config.mask_width
+
         # TODO: driving profile
         # TODO: add accelerometer data embedding
         # TODO: test additional tokens [STR], [THR], [BRK], [ACC], [ROT], etc.
@@ -198,7 +210,11 @@ class CILpp(nn.Module):
 
         action_output = self.action_output(in_memory).unsqueeze(1)  # [B, 1, len(targets)]
 
-        return action_output
+        mask_logits = None
+        if self.mask_head is not None:
+            mask_logits = self.mask_head(in_memory).view(-1, self._mask_h, self._mask_w)
+
+        return action_output, mask_logits
 
     def forward_eval(self, imgs, command, speed):
         """
@@ -229,4 +245,8 @@ class CILpp(nn.Module):
 
         action_output = self.action_output(in_memory).unsqueeze(1)  # [B, 1, len(targets)]
 
-        return action_output, resnet_inter, attn_weights
+        mask_logits = None
+        if self.mask_head is not None:
+            mask_logits = self.mask_head(in_memory).view(-1, self._mask_h, self._mask_w)
+
+        return action_output, resnet_inter, attn_weights, mask_logits

@@ -133,9 +133,18 @@ class CILppPlanner(pl.LightningModule):
         # GT Actions: [B, 3] = [throttle, steer, brake]
         gt_actions = batch["action"].to(dtype=torch.float32)
 
-        pred_act = self.model(imgs, command, speed)  # [B,1,3]
+        pred_act, mask_logits = self.model(imgs, command, speed)  # [B,1,3], [B,H,W] or None
 
         loss, _, _, _ = self.action_nospeed_l1(pred_act, gt_actions)
+
+        # Mask loss (optional auxiliary task)
+        if self.config.mask_loss_enabled and mask_logits is not None and 'waypoint_mask' in batch:
+            mask_labels = batch['waypoint_mask'].to(dtype=torch.float32, device=mask_logits.device)
+            mask_loss = F.binary_cross_entropy_with_logits(
+                mask_logits.flatten(1), (mask_labels > 0.5).float().flatten(1), reduction='mean'
+            )
+            loss = loss + self.config.mask_loss_weight * mask_loss
+            self.log('train/mask_loss', mask_loss, on_step=True, on_epoch=True, sync_dist=True)
 
         # Unweighted MAE per action (pure prediction error)
         pred_last = pred_act[:, -1, :]  # [B, 3]
@@ -178,9 +187,18 @@ class CILppPlanner(pl.LightningModule):
         # GT Actions: [B, 3] = [throttle, steer, brake]
         gt_actions = batch["action"].to(dtype=torch.float32)
 
-        pred_act, _, _ = self.model.forward_eval(imgs, command, speed)  # [B,1,3]
+        pred_act, _, _, mask_logits = self.model.forward_eval(imgs, command, speed)  # [B,1,3]
 
         loss, _, _, _ = self.action_nospeed_l1(pred_act, gt_actions)
+
+        # Mask loss (optional auxiliary task)
+        if self.config.mask_loss_enabled and mask_logits is not None and 'waypoint_mask' in batch:
+            mask_labels = batch['waypoint_mask'].to(dtype=torch.float32, device=mask_logits.device)
+            mask_loss = F.binary_cross_entropy_with_logits(
+                mask_logits.flatten(1), (mask_labels > 0.5).float().flatten(1), reduction='mean'
+            )
+            loss = loss + self.config.mask_loss_weight * mask_loss
+            self.log('val/mask_loss', mask_loss, on_step=False, on_epoch=True, sync_dist=True)
 
         # Unweighted MAE per action (pure prediction error)
         pred_last = pred_act[:, -1, :]  # [B, 3]
@@ -252,6 +270,12 @@ class CILppPlanner(pl.LightningModule):
 @click.option('--loss-w-throttle', help='Throttle loss weight', metavar='FLOAT',                type=click.FloatRange(min=0), default=0.25, show_default=True)
 @click.option('--loss-w-steer',    help='Steer loss weight', metavar='FLOAT',                   type=click.FloatRange(min=0), default=0.50, show_default=True)
 @click.option('--loss-w-brake',    help='Brake loss weight', metavar='FLOAT',                   type=click.FloatRange(min=0), default=0.25, show_default=True)
+# Mask loss & weighted sampling.
+@click.option('--mask-loss/--no-mask-loss', 'mask_loss', help='Enable mask loss', default=False, show_default=True)
+@click.option('--mask-loss-weight', help='Mask loss weight', metavar='FLOAT',                   type=float, default=0.0625, show_default=True)
+@click.option('--weighted-sampling/--no-weighted-sampling', 'weighted_sampling', help='Enable weighted sampling', default=False, show_default=True)
+@click.option('--bucket-weight-type', help='Bucket weight strategy', metavar='TYPE',            type=click.Choice(['uniform', 'preferturns']), default='uniform', show_default=True)
+@click.option('--subsample-ratio', help='Fraction of data per epoch', metavar='FLOAT',          type=click.FloatRange(min=0.01, max=1.0), default=1.0, show_default=True)
 # Misc settings.
 @click.option('--outdir',          help='Where to save the results', metavar='DIR',             type=click.Path(file_okay=False), default=os.getenv('TRAINING_LOG_DIR', os.path.join(os.getcwd(), 'training-runs')), show_default=True)
 @click.option('--desc',            help='Extra string appended to run dir name', metavar='STR', type=str, default=None)
@@ -270,6 +294,8 @@ def main(train_data: str, val_data: str, data_root: str,
          batch_size: int, epochs: int, lr: float, lr_min: float,
          lr_schedule: str, lr_milestones: str, lr_decay: float,
          grad_clip: float, loss_w_throttle: float, loss_w_steer: float, loss_w_brake: float,
+         mask_loss: bool, mask_loss_weight: float,
+         weighted_sampling: bool, bucket_weight_type: str, subsample_ratio: float,
          outdir: str, desc: str, experiment_id: str,
          gpus: int, num_workers: int, seed: int, val_every: int,
          wandb_project: str, no_wandb: bool, profiler: str, dry_run: bool):
@@ -315,6 +341,11 @@ def main(train_data: str, val_data: str, data_root: str,
     config.num_epochs = epochs
     config.img_aug = img_aug
     config.loss_weights = {"throttle": loss_w_throttle, "steer": loss_w_steer, "brake": loss_w_brake}
+    config.mask_loss_enabled = mask_loss
+    config.mask_loss_weight = mask_loss_weight
+    config.weighted_sampling = weighted_sampling
+    config.bucket_weight_type = bucket_weight_type
+    config.subsample_ratio = subsample_ratio
 
     # Build descriptive experiment ID
     experiment_id = build_experiment_id(experiment_id, config, batch_size, epochs, tf32, seed, img_aug)
@@ -388,12 +419,33 @@ def main(train_data: str, val_data: str, data_root: str,
             console.print("\n[yellow]Dry run — exiting without training.[/yellow]")
         return
 
+    # Weighted sampling (optional)
     use_persistent = num_workers > 0
+    sampler = None
+    shuffle_train = True
+    if config.weighted_sampling and train_set.buckets is not None:
+        from cilpp.weighted_sampler import WeightedDistributedSampler
+        sample_weights = train_set.get_sample_weights()
+        if gpus > 1:
+            sampler = WeightedDistributedSampler(
+                train_set, subsample_ratio=config.subsample_ratio,
+                weights=sample_weights, shuffle=True,
+            )
+        else:
+            num_samples = int(len(train_set) * config.subsample_ratio)
+            sampler = torch.utils.data.WeightedRandomSampler(
+                weights=torch.from_numpy(sample_weights).double(),
+                num_samples=num_samples, replacement=True,
+            )
+        shuffle_train = False
+    elif config.weighted_sampling:
+        warnings.warn("--weighted-sampling enabled but no bucket data found in .npy. Falling back to uniform sampling.")
+
     dataloader_train = DataLoader(
         train_set,
         batch_size=batch_size,
-        shuffle=True,
-        sampler=None,  # TODO: test different sampling strategies (e.g., weighted, bins, etc.)
+        shuffle=shuffle_train,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
@@ -459,6 +511,11 @@ def main(train_data: str, val_data: str, data_root: str,
                 "val_data": val_data,
                 "data_root": config.root_dir_all,
                 "img_aug": config.img_aug,
+                "mask_loss": config.mask_loss_enabled,
+                "mask_loss_weight": config.mask_loss_weight,
+                "weighted_sampling": config.weighted_sampling,
+                "bucket_weight_type": config.bucket_weight_type,
+                "subsample_ratio": config.subsample_ratio,
                 "finetune_from": finetune,
                 "resumed_from": resume,
             },
