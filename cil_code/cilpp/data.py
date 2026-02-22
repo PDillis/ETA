@@ -70,6 +70,56 @@ def generate_waypoint_mask(waypoints, config):
     return mask
 
 
+############################################################
+# Sampling strategy registry
+# Each strategy: (buckets: np.ndarray[N, num_buckets]) → np.ndarray[N] float32 weights
+# To add a new strategy: define a function and register it in SAMPLING_STRATEGIES.
+############################################################
+
+NUM_BEHAVIORAL_BUCKETS = 16   # first 16 columns = behavioral buckets
+CMD_BUCKET_START = 16         # columns 16-21 = command buckets
+NUM_CMD_BUCKETS = 6
+
+
+def _weights_uniform(buckets):
+    """Normalize per-bucket, then average across all buckets."""
+    col_sums = buckets.sum(axis=0)
+    col_sums[col_sums == 0] = 1.0
+    return (buckets / col_sums).mean(axis=-1).astype(np.float32)
+
+
+def _weights_preferturns(buckets):
+    """ETA baseline: weighted average over the 16 behavioral buckets only."""
+    MULTIPLIERS = [
+        1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 1.0,  # general + accel
+        3.0, 3.0,                               # steer right/left
+        1.0, 1.0, 1.0,                         # vehicle hazard
+        1.0, 1.0, 1.0, 1.0,                    # stop/red/swerve/ped
+    ]
+    beh = buckets[:, :NUM_BEHAVIORAL_BUCKETS]
+    bw = np.array(MULTIPLIERS[:beh.shape[1]])
+    col_sums = beh.sum(axis=0)
+    col_sums[col_sums == 0] = 1.0
+    return ((beh / col_sums * bw).sum(axis=-1) / bw.sum()).astype(np.float32)
+
+
+def _weights_commands(buckets):
+    """Inverse-frequency weighting on command columns only — equalizes command distribution."""
+    cmd = buckets[:, CMD_BUCKET_START:CMD_BUCKET_START + NUM_CMD_BUCKETS]
+    if cmd.shape[1] == 0:
+        raise ValueError("No command bucket columns found. Regenerate .npy with command bucket support.")
+    cmd_counts = cmd.sum(axis=0)
+    cmd_counts[cmd_counts == 0] = 1.0
+    return (cmd * (1.0 / cmd_counts)).sum(axis=-1).astype(np.float32)
+
+
+SAMPLING_STRATEGIES = {
+    'uniform': _weights_uniform,
+    'preferturns': _weights_preferturns,
+    'commands': _weights_commands,
+}
+
+
 class CARLA_Data(Dataset):
     """
     Bench2Drive → CIL++ dataset.
@@ -185,18 +235,11 @@ class CARLA_Data(Dataset):
         """Compute per-sample weights from bucket vectors. Returns (N,) float32 array."""
         if self.buckets is None:
             raise ValueError("No bucket data available. Regenerate .npy with bucket support.")
-        buckets = self.buckets
-        col_sums = buckets.sum(axis=0)
-        col_sums[col_sums == 0] = 1.0
-        normalized = buckets / col_sums
-
-        if self.config.bucket_weight_type == 'uniform':
-            return normalized.mean(axis=-1).astype(np.float32)
-        elif self.config.bucket_weight_type == 'preferturns':
-            bw = np.array(self.config.bucket_weights)
-            return ((normalized * bw).sum(axis=-1) / bw.sum()).astype(np.float32)
-        else:
-            raise ValueError(f"Unknown bucket_weight_type: {self.config.bucket_weight_type}")
+        strategy = self.config.bucket_weight_type
+        if strategy not in SAMPLING_STRATEGIES:
+            available = ', '.join(sorted(SAMPLING_STRATEGIES.keys()))
+            raise ValueError(f"Unknown sampling strategy '{strategy}'. Available: {available}")
+        return SAMPLING_STRATEGIES[strategy](self.buckets)
 
     def load_image(self, img_path):
         """Load all configured camera views for a given reference image path into the cache."""

@@ -162,10 +162,14 @@ def is_walker_hazard(objects_list):
 ############################################################
 
 BUCKET_NAMES = [
+    # Behavioral buckets (0-15)
     'general', 'acc_scratch', 'acc_light_pedal', 'acc_medium_pedal',
     'acc_heavy_pedal', 'acc_brake', 'acc_coast', 'steer_right', 'steer_left',
     'vehicle_hazard_front', 'vehicle_hazard_back', 'vehicle_hazard_side',
     'stop_sign', 'red_light', 'swerving', 'pedestrian',
+    # Command buckets (16-21, mutually exclusive)
+    'cmd_left', 'cmd_right', 'cmd_straight',
+    'cmd_lanefollow', 'cmd_changelaneleft', 'cmd_changelaneright',
 ]
 
 SWERVING_SCENARIOS = [
@@ -174,8 +178,8 @@ SWERVING_SCENARIOS = [
 ]
 
 
-def compute_buckets(throttle, steer, brake, speed, bounding_boxes, route_name):
-    """Compute 16-element binary bucket vector for a single sample."""
+def compute_buckets(throttle, steer, brake, speed, bounding_boxes, route_name, command):
+    """Compute 22-element binary bucket vector for a single sample."""
     # Acceleration buckets (thresholds from ETA data_parser.py)
     acc_bucket = [
         1 if (throttle > 0.2 and brake < 1.0 and speed < 0.05) else 0,  # scratch
@@ -212,7 +216,11 @@ def compute_buckets(throttle, steer, brake, speed, bounding_boxes, route_name):
     # Pedestrian
     ped_bucket = 1 if is_walker_hazard(bounding_boxes) else 0
 
-    return [1] + acc_bucket + steer_bucket + veh_bucket + [stop_bucket, red_bucket, swerve_bucket, ped_bucket]
+    # Command buckets (VOID=-1 → LANEFOLLOW=4, same convention as data.py)
+    cmd = command if command > 0 else 4
+    cmd_bucket = [1 if cmd == c else 0 for c in [1, 2, 3, 4, 5, 6]]
+
+    return [1] + acc_bucket + steer_bucket + veh_bucket + [stop_bucket, red_bucket, swerve_bucket, ped_bucket] + cmd_bucket
 
 
 def _all_finite(*xs) -> bool:
@@ -408,7 +416,7 @@ def process_single_route(
 
         # Bucket computation
         bounding_boxes = anno.get('bounding_boxes', [])
-        bucket = compute_buckets(throttle, steer, brake, cur_speed, bounding_boxes, basename)
+        bucket = compute_buckets(throttle, steer, brake, cur_speed, bounding_boxes, basename, anno["next_command"])
         seq_buckets.append(bucket)
 
     with count.get_lock():

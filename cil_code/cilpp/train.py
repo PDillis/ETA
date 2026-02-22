@@ -274,7 +274,7 @@ class CILppPlanner(pl.LightningModule):
 @click.option('--mask-loss/--no-mask-loss', 'mask_loss', help='Enable mask loss', default=False, show_default=True)
 @click.option('--mask-loss-weight', help='Mask loss weight', metavar='FLOAT',                   type=float, default=0.0625, show_default=True)
 @click.option('--weighted-sampling/--no-weighted-sampling', 'weighted_sampling', help='Enable weighted sampling', default=False, show_default=True)
-@click.option('--bucket-weight-type', help='Bucket weight strategy', metavar='TYPE',            type=click.Choice(['uniform', 'preferturns']), default='uniform', show_default=True)
+@click.option('--bucket-weight-type', help='Bucket weight strategy', metavar='TYPE',            type=click.Choice(['uniform', 'preferturns', 'commands']), default='uniform', show_default=True)
 @click.option('--subsample-ratio', help='Fraction of data per epoch', metavar='FLOAT',          type=click.FloatRange(min=0.01, max=1.0), default=1.0, show_default=True)
 # Misc settings.
 @click.option('--outdir',          help='Where to save the results', metavar='DIR',             type=click.Path(file_okay=False), default=os.getenv('TRAINING_LOG_DIR', os.path.join(os.getcwd(), 'training-runs')), show_default=True)

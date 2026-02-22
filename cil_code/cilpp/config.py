@@ -108,26 +108,8 @@ class GlobalConfig:
 
 	# ==== Weighted Sampling ====
 	weighted_sampling = False
-	bucket_weight_type = 'uniform'      # 'uniform' or 'preferturns'
+	bucket_weight_type = 'uniform'      # Strategy: 'uniform', 'preferturns', 'commands' (see data.py SAMPLING_STRATEGIES)
 	subsample_ratio = 1.0               # 1.0 = full dataset, 0.6 = 60%
-	bucket_weights = [
-		1.0,  # general
-		1.0,  # acc_scratch
-		2.0,  # acc_light_pedal
-		2.0,  # acc_medium_pedal
-		1.0,  # acc_heavy_pedal
-		1.0,  # acc_brake
-		1.0,  # acc_coast
-		3.0,  # steer_right
-		3.0,  # steer_left
-		1.0,  # vehicle_hazard_front
-		1.0,  # vehicle_hazard_back
-		1.0,  # vehicle_hazard_side
-		1.0,  # stop_sign
-		1.0,  # red_light
-		1.0,  # swerving
-		1.0,  # pedestrian
-	]
 
 	# ==== Model ====
 	backbone = "resnet34"  # backbone architecture (overridable via CLI)
