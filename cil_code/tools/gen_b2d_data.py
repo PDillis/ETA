@@ -34,9 +34,11 @@ Usage:
 
 import os
 import sys
+import glob
 import json
 import yaml
 import click
+import shutil
 import numpy as np
 import multiprocessing as mp
 from typing import Optional, List, Dict, Any
@@ -547,20 +549,21 @@ def process_single_route(
 def worker(
     folder_paths: mp.Queue,
     count,
-    seq_data_list,
+    staging_dir: str,
     adapter,
     config,
     worker_id: int = 0,
     progress_queue: Optional[mp.Queue] = None,
 ):
-    """Worker process for parallel route processing."""
+    """Worker process: processes routes and saves each to a per-route .npy in staging_dir."""
     while True:
         if folder_paths.qsize() <= 0:
             break
         folder_path = folder_paths.get()
         seq_data = process_single_route(folder_path, adapter, config, count, worker_id, progress_queue)
         if seq_data is not None:
-            seq_data_list.append(seq_data)
+            route_name = os.path.basename(folder_path)
+            np.save(os.path.join(staging_dir, f'{route_name}.npy'), seq_data)
 
     if progress_queue is not None:
         progress_queue.put({'type': 'worker_done', 'worker_id': worker_id})
@@ -623,13 +626,14 @@ def run_rich_display(progress_queue: mp.Queue, num_workers: int, group_counts: D
                 done_workers += 1
 
 
-def aggregate_and_save(seq_data_list: List[Dict], output_path: str,
+def aggregate_and_save(staging_dir: str, output_path: str,
                        sensor_list: Optional[List[str]] = None,
                        sensor_meta: Optional[Dict] = None,
                        warm_load: bool = False,
                        warm_load_size: Optional[List[int]] = None):
-    """Aggregate data from all routes and save to .npy file."""
-    console.print('\n[bold]Aggregating and saving...[/bold]')
+    """Merge per-route .npy files from staging_dir into a single output .npy."""
+    route_files = sorted(glob.glob(os.path.join(staging_dir, '*.npy')))
+    console.print(f'\n[bold]Merging {len(route_files)} route files...[/bold]')
 
     total_data = {
         'future_x': [], 'future_y': [], 'future_theta': [],
@@ -652,15 +656,14 @@ def aggregate_and_save(seq_data_list: List[Dict], output_path: str,
 
     _skipped_nan_total = 0
 
-    for seq_data in seq_data_list:
-        if not seq_data:
-            continue
-        skipped_nan = seq_data.pop('skipped_nan')
-        _skipped_nan_total += skipped_nan
+    for route_file in route_files:
+        seq_data = np.load(route_file, allow_pickle=True).item()
+        _skipped_nan_total += seq_data.pop('skipped_nan', 0)
 
         for key in total_data.keys():
             if key in seq_data:
                 total_data[key].extend(seq_data[key])
+        del seq_data  # free memory immediately
 
     total_data['bucket_names'] = BUCKET_NAMES
 
@@ -818,50 +821,73 @@ def main(config, dataset_root, name, output, is_train, input_fps, output_fps, in
             first_anno = adapter.load_annotation(first_anno_path)
             sensor_meta = first_anno.get('sensors', {})
 
-    # Prepare multiprocessing
-    folder_paths = mp.Queue()
-    seq_data_list = mp.Manager().list()
-    count = mp.Value('d', 0)
-    progress_queue = mp.Queue()
+    # Staging directory for per-route .npy files (enables resumability)
+    staging_dir = output + '.partial'
+    os.makedirs(staging_dir, exist_ok=True)
 
-    for route_folder in route_folders:
-        folder_paths.put(route_folder)
+    # Resumability: find already-processed routes in the staging directory
+    already_done = {os.path.splitext(f)[0] for f in os.listdir(staging_dir) if f.endswith('.npy')}
+    routes_to_process = [rf for rf in route_folders if os.path.basename(rf) not in already_done]
 
-    # Start workers
-    ps = []
-    processing_config = {
-        'input_frames': input_frames,
-        'future_frames': future_frames,
-        'step': step,
-        'warm_load': warm_load,
-        'sensor_list': sensor_list,
-        'img_w': img_w,
-        'img_h': img_h,
-    }
+    if already_done:
+        console.print(f'[cyan]Resuming: {len(already_done)} routes already processed, '
+                      f'{len(routes_to_process)} remaining[/cyan]')
 
-    for i in range(num_workers):
-        p = mp.Process(
-            target=worker,
-            args=(folder_paths, count, seq_data_list, adapter, processing_config, i, progress_queue),
-        )
-        p.daemon = True
-        p.start()
-        ps.append(p)
+    # Only spawn workers if there are routes left to process
+    if routes_to_process:
+        # Recompute group counts for remaining routes only (for progress display)
+        remaining_group_counts: Dict[str, int] = {}
+        for rf in routes_to_process:
+            g = adapter.get_route_group(os.path.basename(rf))
+            remaining_group_counts[g] = remaining_group_counts.get(g, 0) + 1
 
-    # Run Rich display in the main process (blocks until all workers done)
-    run_rich_display(progress_queue, num_workers, group_counts)
+        folder_paths = mp.Queue()
+        count = mp.Value('d', 0)
+        progress_queue = mp.Queue()
 
-    for p in ps:
-        p.join()
+        for rf in routes_to_process:
+            folder_paths.put(rf)
 
-    # Aggregate and save
+        # Start workers — save per-route .npy to staging_dir (no Manager needed)
+        ps = []
+        processing_config = {
+            'input_frames': input_frames,
+            'future_frames': future_frames,
+            'step': step,
+            'warm_load': warm_load,
+            'sensor_list': sensor_list,
+            'img_w': img_w,
+            'img_h': img_h,
+        }
+
+        for i in range(num_workers):
+            p = mp.Process(
+                target=worker,
+                args=(folder_paths, count, staging_dir, adapter, processing_config, i, progress_queue),
+            )
+            p.start()
+            ps.append(p)
+
+        # Run Rich display in the main process (blocks until all workers done)
+        run_rich_display(progress_queue, num_workers, remaining_group_counts)
+
+        for p in ps:
+            p.join()
+    else:
+        console.print('[green]All routes already processed. Proceeding to merge.[/green]')
+
+    # Merge all per-route .npy files into the final output
     aggregate_and_save(
-        seq_data_list, output,
+        staging_dir, output,
         sensor_list=sensor_list,
         sensor_meta=sensor_meta,
         warm_load=warm_load,
         warm_load_size=[img_h, img_w] if warm_load else None,
     )
+
+    # Clean up staging directory after successful merge
+    shutil.rmtree(staging_dir)
+    console.print(f'[dim]Cleaned up staging directory: {staging_dir}[/dim]')
 
 
 if __name__ == '__main__':
