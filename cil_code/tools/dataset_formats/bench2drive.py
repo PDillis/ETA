@@ -16,6 +16,16 @@ from typing import List, Dict, Tuple, Optional
 from .base import DatasetFormatAdapter
 
 
+# Sensor file extensions (synced with SENSOR_INFO in gen_b2d_data.py)
+SENSOR_EXT = {
+    'rgb': '.jpg',
+    'depth': '.png',
+    'semantic': '.png',
+    'instance': '.png',
+    'lidar': '.laz',
+    'radar': '.h5',
+}
+
 # Default validation routes from Bench2Drive paper (48 routes)
 DEFAULT_VAL_ROUTES = [
     'StaticCutIn_Town05_Route226_Weather18',
@@ -150,6 +160,29 @@ class Bench2DriveAdapter(DatasetFormatAdapter):
     def get_image_path(self, route_folder: str, camera: str, frame_idx: int) -> str:
         """Return path to image file in camera/rgb_front/ structure."""
         return os.path.join(route_folder, f'camera/{camera}/{frame_idx:05}.jpg')
+
+    def get_sensor_path(self, route_folder: str, sensor_name: str, frame_idx: int) -> str:
+        """
+        Return path for any sensor type.
+
+        Camera sensors (rgb, depth, semantic, instance) live under camera/:
+            route_folder/camera/{sensor_name}/{frame_idx:05}{ext}
+
+        Non-camera sensors (lidar, radar) have their own top-level dirs:
+            route_folder/lidar/{frame_idx:05}.laz
+            route_folder/radar/{frame_idx:05}.h5
+
+        Args:
+            sensor_name: Full sensor name, e.g. 'rgb_front', 'depth_front_left', 'lidar_top'
+        """
+        sensor_type = sensor_name.split('_')[0]
+        ext = SENSOR_EXT.get(sensor_type)
+        if ext is None:
+            raise ValueError(f"Unknown sensor type '{sensor_type}' from sensor_name '{sensor_name}'. "
+                             f"Valid types: {sorted(SENSOR_EXT.keys())}")
+        if sensor_type in ('lidar', 'radar'):
+            return os.path.join(route_folder, f'{sensor_type}/{frame_idx:05}{ext}')
+        return os.path.join(route_folder, f'camera/{sensor_name}/{frame_idx:05}{ext}')
 
     def get_expert_assessment_path(self, route_folder: str, frame_idx: int) -> str:
         """

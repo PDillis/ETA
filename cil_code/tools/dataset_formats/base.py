@@ -152,6 +152,20 @@ class DatasetFormatAdapter(ABC):
         """
         return route_name
 
+    def get_sensor_path(self, route_folder: str, sensor_name: str, frame_idx: int) -> str:
+        """
+        Return the path to a sensor file (any type: rgb, depth, semantic, lidar, etc.).
+
+        Args:
+            route_folder: Path to the route directory
+            sensor_name: Full sensor name (e.g., 'rgb_front', 'depth_front_left', 'lidar_top')
+            frame_idx: Frame index (0-based)
+
+        Returns:
+            Full path to the sensor file
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement get_sensor_path()")
+
     def validate_route(self, route_folder: str) -> bool:
         """
         Optional: Validate that a route directory has the expected structure.

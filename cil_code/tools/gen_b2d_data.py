@@ -41,6 +41,7 @@ import numpy as np
 import multiprocessing as mp
 from typing import Optional, List, Dict, Any
 from pathlib import Path
+from PIL import Image
 from rich.console import Console
 from rich.progress import (
     Progress, BarColumn, TextColumn, TimeElapsedColumn,
@@ -57,17 +58,78 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from tools.dataset_formats import Bench2DriveAdapter, Play2DriveAdapter
 
 
-def make_output_name(name: str, output_fps: int, input_frames: int, future_frames: int, split: str) -> str:
+############################################################
+# Sensor info & camera position constants
+############################################################
+
+SENSOR_INFO = {
+    # Camera sensor types (used with --sensor-types × --cameras)
+    'rgb':      {'abbrev': 'RGB', 'ext': '.jpg', 'is_camera': True},
+    'depth':    {'abbrev': 'D',   'ext': '.png', 'is_camera': True},
+    'semantic': {'abbrev': 'SS',  'ext': '.png', 'is_camera': True},
+    'instance': {'abbrev': 'IS',  'ext': '.png', 'is_camera': True},
+    # Additional sensors (used with --additional-sensors, not camera-based)
+    'lidar':    {'abbrev': 'LDR', 'ext': '.laz', 'is_camera': False},
+    'radar':    {'abbrev': 'RDR', 'ext': '.h5',  'is_camera': False},
+}
+
+FRONT_POSITIONS = {'front', 'front_left', 'front_right'}
+BACK_POSITIONS = {'back', 'back_left', 'back_right'}
+ALL_CAMERA_POSITIONS = FRONT_POSITIONS | BACK_POSITIONS | {'top_down'}
+VALID_CAMERA_SENSOR_TYPES = {k for k, v in SENSOR_INFO.items() if v['is_camera']}
+VALID_ADDITIONAL_SENSORS = {k for k, v in SENSOR_INFO.items() if not v['is_camera']}
+
+
+def parse_and_validate(value, valid_set, label):
+    """Parse comma-separated string and validate each item against valid_set."""
+    items = [x.strip() for x in value.split(',') if x.strip()]
+    invalid = set(items) - valid_set
+    if invalid:
+        raise click.BadParameter(
+            f"Invalid {label}: {invalid}. Valid: {sorted(valid_set)}"
+        )
+    return items
+
+
+def make_camera_string(positions):
+    """Build camera count string for filename: e.g. '3F0B', '3F3B1T'."""
+    nf = sum(1 for p in positions if p in FRONT_POSITIONS)
+    nb = sum(1 for p in positions if p in BACK_POSITIONS)
+    s = f'{nf}F{nb}B'
+    nt = sum(1 for p in positions if p == 'top_down')
+    if nt:
+        s += f'{nt}T'
+    return s
+
+
+def make_sensor_string(sensor_types, additional_sensors):
+    """Build sensor abbreviation string for filename: e.g. 'RGB+D+SS+LDR'."""
+    all_types = list(sensor_types) + list(additional_sensors)
+    return '+'.join(SENSOR_INFO[s]['abbrev'] for s in all_types)
+
+
+def build_sensor_list(positions, sensor_types):
+    """Camera positions × camera sensor types → ['rgb_front', 'depth_front', ...]"""
+    return [f'{st}_{pos}' for st in sensor_types for pos in positions]
+
+
+def make_output_name(name: str, output_fps: int, input_frames: int, future_frames: int,
+                     split: str, camera_string: str = '', sensor_string: str = '') -> str:
     """
     Auto-generate an output filename from dataset parameters.
 
-    Format: {name}_{output_fps}Hz_{input_frames}Input_{future_frames}Future-{split}.npy
+    Format: {name}_{output_fps}Hz_{input_frames}Input_{future_frames}Future_{cameras}_{sensors}-{split}.npy
 
     Examples:
-        b2d-base_2Hz_1Input_8Future-train.npy
-        play2drive_10Hz_2Input_8Future-val.npy
+        b2d-base_2Hz_1Input_8Future_3F0B_RGB-train.npy
+        b2d-base_2Hz_1Input_8Future_3F0B_RGB+D+SS+LDR-train.npy
     """
-    return f"{name}_{output_fps}Hz_{input_frames}Input_{future_frames}Future-{split}.npy"
+    parts = [f"{name}_{output_fps}Hz_{input_frames}Input_{future_frames}Future"]
+    if camera_string:
+        parts.append(camera_string)
+    if sensor_string:
+        parts.append(sensor_string)
+    return '_'.join(parts) + f'-{split}.npy'
 
 
 ############################################################
@@ -273,6 +335,12 @@ def process_single_route(
     if length < input_frames + future_frames_raw:
         return None
 
+    # Warm-load config
+    warm_load = config.get('warm_load', False)
+    sensor_list = config.get('sensor_list', [])
+    img_w = config.get('img_w', 300)
+    img_h = config.get('img_h', 300)
+
     # Sequence lists
     seq_future_x, seq_future_y, seq_future_theta = [], [], []
     seq_future_feature, seq_future_action, seq_future_action_index = [], [], []
@@ -288,6 +356,9 @@ def process_single_route(
     seq_acceleration = []
     seq_angular_velocity = []
     seq_buckets = []
+
+    # Per-sensor image lists (warm-load only)
+    seq_images = {sensor: [] for sensor in sensor_list} if warm_load else {}
 
     # Full sequences (for downsampling)
     full_seq_x, full_seq_y, full_seq_theta = [], [], []
@@ -419,6 +490,13 @@ def process_single_route(
         bucket = compute_buckets(throttle, steer, brake, cur_speed, bounding_boxes, basename, anno["next_command"])
         seq_buckets.append(bucket)
 
+        # Warm-load: open, resize, and store sensor images
+        if warm_load:
+            for sensor_name in sensor_list:
+                img_path = adapter.get_sensor_path(route_folder, sensor_name, i)
+                img = np.array(Image.open(img_path).resize((img_w, img_h), Image.BILINEAR))
+                seq_images[sensor_name].append(img)
+
     with count.get_lock():
         count.value += 1
 
@@ -430,7 +508,7 @@ def process_single_route(
             'skipped': _skipped_nan,
         })
 
-    return {
+    result = {
         'future_x': seq_future_x,
         'future_y': seq_future_y,
         'future_theta': seq_future_theta,
@@ -458,6 +536,12 @@ def process_single_route(
         'buckets': seq_buckets,
         'skipped_nan': _skipped_nan,
     }
+
+    # Add warm-loaded sensor images
+    if warm_load:
+        result.update(seq_images)
+
+    return result
 
 
 def worker(
@@ -539,7 +623,11 @@ def run_rich_display(progress_queue: mp.Queue, num_workers: int, group_counts: D
                 done_workers += 1
 
 
-def aggregate_and_save(seq_data_list: List[Dict], output_path: str):
+def aggregate_and_save(seq_data_list: List[Dict], output_path: str,
+                       sensor_list: Optional[List[str]] = None,
+                       sensor_meta: Optional[Dict] = None,
+                       warm_load: bool = False,
+                       warm_load_size: Optional[List[int]] = None):
     """Aggregate data from all routes and save to .npy file."""
     console.print('\n[bold]Aggregating and saving...[/bold]')
 
@@ -557,6 +645,11 @@ def aggregate_and_save(seq_data_list: List[Dict], output_path: str):
         'buckets': [],
     }
 
+    # Add per-sensor keys when warm-loading
+    if warm_load and sensor_list:
+        for sensor in sensor_list:
+            total_data[sensor] = []
+
     _skipped_nan_total = 0
 
     for seq_data in seq_data_list:
@@ -566,11 +659,22 @@ def aggregate_and_save(seq_data_list: List[Dict], output_path: str):
         _skipped_nan_total += skipped_nan
 
         for key in total_data.keys():
-            total_data[key].extend(seq_data[key])
+            if key in seq_data:
+                total_data[key].extend(seq_data[key])
 
     total_data['bucket_names'] = BUCKET_NAMES
+
+    # Sensor metadata (always stored for provenance)
+    if sensor_list:
+        total_data['sensor_list'] = sensor_list
+    if sensor_meta:
+        total_data['sensor_meta'] = sensor_meta
+    total_data['warm_load_size'] = warm_load_size if warm_load else None
+
     np.save(output_path, total_data)
     console.print(f'[green]Saved {len(total_data["front_img"])} sequences to {output_path}[/green]')
+    if warm_load and sensor_list:
+        console.print(f'[green]Warm-loaded sensors: {sensor_list}[/green]')
     console.print(f'[yellow]Total sequences skipped due to NaN/Inf: {_skipped_nan_total}[/yellow]')
 
 
@@ -587,7 +691,12 @@ def aggregate_and_save(seq_data_list: List[Dict], output_path: str):
 @click.option('--val-routes', help='Validation route file (one per line)', type=click.Path(exists=True), default=None)
 @click.option('--format', 'dataset_format', help='Dataset format', type=click.Choice(['bench2drive', 'play2drive']), default='bench2drive', show_default=True)
 @click.option('--num-workers', help='Number of parallel workers', type=int, default=64, show_default=True)
-def main(config, dataset_root, name, output, is_train, input_fps, output_fps, input_frames, future_frames, val_routes, dataset_format, num_workers):
+@click.option('--cameras', help='Camera positions (comma-sep)', type=str, default='front,front_left,front_right', show_default=True)
+@click.option('--sensor-types', help='Camera sensor types (comma-sep)', type=str, default='rgb', show_default=True)
+@click.option('--additional-sensors', help='Non-camera sensors (comma-sep), e.g. lidar,radar', type=str, default=None)
+@click.option('--warm-load/--no-warm-load', help='Store resized image arrays in .npy', default=False, show_default=True)
+@click.option('--img-size', help='Resize images to HxW during warm-load', type=str, default='300x300', show_default=True)
+def main(config, dataset_root, name, output, is_train, input_fps, output_fps, input_frames, future_frames, val_routes, dataset_format, num_workers, cameras, sensor_types, additional_sensors, warm_load, img_size):
     """
     Generate .npy training/validation data with configurable parameters.
 
@@ -626,12 +735,34 @@ def main(config, dataset_root, name, output, is_train, input_fps, output_fps, in
     step = input_fps // output_fps
     split = 'train' if is_train else 'val'
 
+    # Validate and parse sensor options
+    camera_positions = parse_and_validate(cameras, ALL_CAMERA_POSITIONS, 'camera positions')
+    cam_sensor_types = parse_and_validate(sensor_types, VALID_CAMERA_SENSOR_TYPES, 'sensor types')
+    add_sensors = parse_and_validate(additional_sensors, VALID_ADDITIONAL_SENSORS, 'additional sensors') if additional_sensors else []
+
+    sensor_list = build_sensor_list(camera_positions, cam_sensor_types)
+    for s in add_sensors:
+        sensor_list.append(f'{s}_top')  # e.g. 'lidar_top', 'radar_top'
+
+    camera_string = make_camera_string(camera_positions)
+    sensor_string = make_sensor_string(cam_sensor_types, add_sensors)
+
+    # Parse warm-load image size
+    img_h, img_w = 300, 300
+    if warm_load:
+        try:
+            parts = img_size.lower().split('x')
+            img_h, img_w = int(parts[0]), int(parts[1])
+        except (ValueError, IndexError):
+            raise click.BadParameter(f"--img-size must be HxW (e.g. 300x300), got '{img_size}'")
+
     # Resolve output path: explicit --output overrides auto-generated name
     if output is None:
         output = output or cfg.get('output', {}).get('path')
     if output is None:
         base_name = name or os.path.basename(dataset_root.rstrip('/'))
-        output = make_output_name(base_name, output_fps, input_frames, future_frames, split)
+        output = make_output_name(base_name, output_fps, input_frames, future_frames,
+                                  split, camera_string, sensor_string)
 
     # Load validation routes if provided
     val_route_list = None
@@ -666,6 +797,10 @@ def main(config, dataset_root, name, output, is_train, input_fps, output_fps, in
         ('Output FPS', f'{output_fps} Hz  (step={step})'),
         ('Input Frames', str(input_frames)),
         ('Future Frames', f'{future_frames}  (at {output_fps} Hz)'),
+        ('Cameras', f'{camera_string}  ({", ".join(camera_positions)})'),
+        ('Sensor Types', sensor_string),
+        ('Sensors', ', '.join(sensor_list)),
+        ('Warm Load', f'{warm_load}' + (f'  ({img_h}x{img_w})' if warm_load else '')),
         ('Output', output),
         ('Num Workers', str(num_workers)),
     ]
@@ -673,6 +808,15 @@ def main(config, dataset_root, name, output, is_train, input_fps, output_fps, in
         cfg_table.add_row(key, val)
     console.print(cfg_table)
     console.print()
+
+    # Extract sensor metadata from first annotation (intrinsics, extrinsics)
+    sensor_meta = {}
+    if route_folders:
+        first_route = route_folders[0]
+        first_anno_path = adapter.get_annotation_path(first_route, 0)
+        if os.path.exists(first_anno_path):
+            first_anno = adapter.load_annotation(first_anno_path)
+            sensor_meta = first_anno.get('sensors', {})
 
     # Prepare multiprocessing
     folder_paths = mp.Queue()
@@ -689,6 +833,10 @@ def main(config, dataset_root, name, output, is_train, input_fps, output_fps, in
         'input_frames': input_frames,
         'future_frames': future_frames,
         'step': step,
+        'warm_load': warm_load,
+        'sensor_list': sensor_list,
+        'img_w': img_w,
+        'img_h': img_h,
     }
 
     for i in range(num_workers):
@@ -707,7 +855,13 @@ def main(config, dataset_root, name, output, is_train, input_fps, output_fps, in
         p.join()
 
     # Aggregate and save
-    aggregate_and_save(seq_data_list, output)
+    aggregate_and_save(
+        seq_data_list, output,
+        sensor_list=sensor_list,
+        sensor_meta=sensor_meta,
+        warm_load=warm_load,
+        warm_load_size=[img_h, img_w] if warm_load else None,
+    )
 
 
 if __name__ == '__main__':

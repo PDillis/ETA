@@ -231,6 +231,21 @@ class CARLA_Data(Dataset):
         if 'buckets' in data:
             self.buckets = np.array(data['buckets'], dtype=np.float64)
 
+        # Warm-loaded sensor images (optional — backward compatible with path-based .npy)
+        self.warm_loaded = data.get('warm_load_size', None) is not None
+        self.sensor_list = data.get('sensor_list', None)
+        self.sensor_images = {}
+        if self.warm_loaded and self.sensor_list:
+            for sensor_name in self.sensor_list:
+                if sensor_name in data:
+                    self.sensor_images[sensor_name] = data[sensor_name]
+            if self.verbose:
+                print(f'Warm-loaded sensors: {list(self.sensor_images.keys())} '
+                      f'(size: {data["warm_load_size"]})')
+
+        # Sensor metadata (intrinsics/extrinsics, optional)
+        self.sensor_meta = data.get('sensor_meta', None)
+
     def get_sample_weights(self):
         """Compute per-sample weights from bucket vectors. Returns (N,) float32 array."""
         if self.buckets is None:
@@ -264,12 +279,17 @@ class CARLA_Data(Dataset):
 
         resize_dims = (self.img_width, self.img_height)
         for cam_name in self.data_used:
-            cam_path = base_path.replace(self.reference_camera, cam_name)
-            if self.load_to_memory:
-                cam_img = self.img_cache[cam_path]
+            if self.warm_loaded and cam_name in self.sensor_images:
+                # Already resized at generation time — skip resize
+                cam_img = self._ensure_pil(self.sensor_images[cam_name][index])
             else:
-                cam_img = np.array(Image.open(cam_path))
-            data[cam_name] = self._ensure_pil(cam_img).resize(resize_dims, Image.BILINEAR)
+                cam_path = base_path.replace(self.reference_camera, cam_name)
+                if self.load_to_memory:
+                    cam_img = self.img_cache[cam_path]
+                else:
+                    cam_img = np.array(Image.open(cam_path))
+                cam_img = self._ensure_pil(cam_img).resize(resize_dims, Image.BILINEAR)
+            data[cam_name] = cam_img
 
         # ---------- Normalize like CIL++ ----------
         if self.split == "train":
