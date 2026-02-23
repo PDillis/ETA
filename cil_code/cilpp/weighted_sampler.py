@@ -1,9 +1,11 @@
 """
-Weighted distributed sampler for DDP-compatible bucket-based sampling.
+Samplers for DDP-compatible bucket-based and shard-grouped sampling.
 
-Ported from ETA: carformer/carformer/utils/distributedsampler.py
+WeightedDistributedSampler: ported from ETA: carformer/carformer/utils/distributedsampler.py
+ShardGroupedSampler: reorders any base sampler's output for shard cache efficiency.
 """
 
+import bisect
 import math
 import warnings
 
@@ -91,3 +93,58 @@ class WeightedDistributedSampler(torch.utils.data.Sampler):
 
     def set_epoch(self, epoch):
         self.epoch = epoch
+
+
+class ShardGroupedSampler(torch.utils.data.Sampler):
+    """Reorders indices from a base sampler to group by shard for cache efficiency.
+
+    Wraps any sampler (shuffle, weighted, distributed) and reorders its output
+    so consecutive indices come from the same shard. Shard order is shuffled
+    each epoch. Within each shard group, the base sampler's order is preserved.
+
+    This is critical for lazy shard loading: without grouping, random access
+    across ~950 shards causes each __getitem__ to load a new ~155MB file.
+    With grouping, consecutive calls hit the same cached shard.
+
+    Args:
+        base_sampler: Any sampler whose output will be reordered.
+        shard_offsets: Cumulative sample offsets per shard (from CARLA_Data.shard_offsets).
+                       Length = num_shards + 1 (last entry is total_samples sentinel).
+        seed: Random seed for deterministic shard shuffling (DDP-safe).
+    """
+
+    def __init__(self, base_sampler, shard_offsets, seed=0):
+        self.base_sampler = base_sampler
+        self.offsets = list(shard_offsets)
+        self.seed = seed
+        self.epoch = 0
+
+    def __iter__(self):
+        indices = list(self.base_sampler)
+
+        # Group indices by shard (preserving base sampler's order within each group)
+        num_shards = len(self.offsets) - 1
+        buckets = [[] for _ in range(num_shards)]
+        for idx in indices:
+            shard_idx = bisect.bisect_right(self.offsets, idx) - 1
+            buckets[shard_idx].append(idx)
+
+        # Shuffle shard order each epoch (deterministic for DDP consistency)
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        shard_order = torch.randperm(num_shards, generator=g).tolist()
+
+        # Concatenate in shuffled shard order
+        result = []
+        for s in shard_order:
+            result.extend(buckets[s])
+
+        return iter(result)
+
+    def __len__(self):
+        return len(self.base_sampler)
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+        if hasattr(self.base_sampler, 'set_epoch'):
+            self.base_sampler.set_epoch(epoch)

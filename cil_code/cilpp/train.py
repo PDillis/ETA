@@ -276,6 +276,7 @@ class CILppPlanner(pl.LightningModule):
 @click.option('--weighted-sampling/--no-weighted-sampling', 'weighted_sampling', help='Enable weighted sampling', default=False, show_default=True)
 @click.option('--bucket-weight-type', help='Bucket weight strategy', metavar='TYPE',            type=click.Choice(['uniform', 'preferturns', 'commands']), default='uniform', show_default=True)
 @click.option('--subsample-ratio', help='Fraction of data per epoch', metavar='FLOAT',          type=click.FloatRange(min=0.01, max=1.0), default=1.0, show_default=True)
+@click.option('--shard-cache-size', help='LRU shard cache size per DataLoader worker', metavar='INT', type=click.IntRange(min=1), default=2, show_default=True)
 # Misc settings.
 @click.option('--outdir',          help='Where to save the results', metavar='DIR',             type=click.Path(file_okay=False), default=os.getenv('TRAINING_LOG_DIR', os.path.join(os.getcwd(), 'training-runs')), show_default=True)
 @click.option('--desc',            help='Extra string appended to run dir name', metavar='STR', type=str, default=None)
@@ -296,6 +297,7 @@ def main(train_data: str, val_data: str, data_root: str,
          grad_clip: float, loss_w_throttle: float, loss_w_steer: float, loss_w_brake: float,
          mask_loss: bool, mask_loss_weight: float,
          weighted_sampling: bool, bucket_weight_type: str, subsample_ratio: float,
+         shard_cache_size: int,
          outdir: str, desc: str, experiment_id: str,
          gpus: int, num_workers: int, seed: int, val_every: int,
          wandb_project: str, no_wandb: bool, profiler: str, dry_run: bool):
@@ -346,6 +348,7 @@ def main(train_data: str, val_data: str, data_root: str,
     config.weighted_sampling = weighted_sampling
     config.bucket_weight_type = bucket_weight_type
     config.subsample_ratio = subsample_ratio
+    config.shard_cache_size = shard_cache_size
 
     # Build descriptive experiment ID
     experiment_id = build_experiment_id(experiment_id, config, batch_size, epochs, tf32, seed, img_aug)
@@ -441,6 +444,22 @@ def main(train_data: str, val_data: str, data_root: str,
     elif config.weighted_sampling:
         warnings.warn("--weighted-sampling enabled but no bucket data found in .npy. Falling back to uniform sampling.")
 
+    # Shard-grouped sampling: reorder indices by shard for cache locality.
+    # Without this, random shuffle across ~950 shards gives ~0% cache hit rate,
+    # and each __getitem__ loads a new ~155MB file from disk.
+    if train_set._shard_mode:
+        from cilpp.weighted_sampler import ShardGroupedSampler
+        from torch.utils.data import RandomSampler
+        if sampler is not None:
+            sampler = ShardGroupedSampler(sampler, train_set.shard_offsets, seed=seed)
+        else:
+            base = RandomSampler(train_set)
+            sampler = ShardGroupedSampler(base, train_set.shard_offsets, seed=seed)
+            shuffle_train = False
+
+    # Reduce prefetch for shard mode (each prefetched batch holds full image tensors)
+    train_prefetch = 2 if num_workers > 0 else None
+
     dataloader_train = DataLoader(
         train_set,
         batch_size=batch_size,
@@ -450,7 +469,7 @@ def main(train_data: str, val_data: str, data_root: str,
         pin_memory=True,
         drop_last=True,
         persistent_workers=use_persistent,
-        prefetch_factor=4 if num_workers > 0 else None,
+        prefetch_factor=train_prefetch,
         worker_init_fn=_worker_init_fn,
     )
     dataloader_val = DataLoader(

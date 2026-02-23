@@ -330,7 +330,7 @@ class CARLA_Data(Dataset):
         self.sensor_images = {}  # not used in shard mode
 
         # LRU cache for loaded shards
-        self._shard_cache_size = getattr(self.config, 'shard_cache_size', 20)
+        self._shard_cache_size = getattr(self.config, 'shard_cache_size', 2)
         self._shard_cache = {}
         self._shard_lru = []  # ordered list for LRU eviction
 
@@ -367,6 +367,11 @@ class CARLA_Data(Dataset):
         self._shard_cache[shard_idx] = shard
         self._shard_lru.append(shard_idx)
         return shard
+
+    @property
+    def shard_offsets(self):
+        """Cumulative sample offsets per shard (for ShardGroupedSampler)."""
+        return self._shard_offsets if self._shard_mode else None
 
     # ==================================================================
     # Shared interface
