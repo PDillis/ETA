@@ -1,4 +1,6 @@
 import os
+import json
+import bisect
 import random
 from PIL import Image
 import numpy as np
@@ -120,11 +122,29 @@ SAMPLING_STRATEGIES = {
 }
 
 
+############################################################
+# Helper: detect whether data_path is a shard directory
+############################################################
+
+def _is_shard_path(data_path):
+    """Return True if data_path points to a shard directory or manifest.json."""
+    if os.path.isdir(data_path):
+        return os.path.exists(os.path.join(data_path, 'manifest.json'))
+    if os.path.basename(data_path) == 'manifest.json':
+        return True
+    return False
+
+
 class CARLA_Data(Dataset):
     """
     Bench2Drive → CIL++ dataset.
-    Loads three camera views and resizes them based on config,
-    before any normalization/augmentation is applied.
+
+    Supports two loading modes:
+    - **Monolithic**: Single .npy file loaded entirely into memory (original behavior).
+    - **Sharded**: Per-route .npy files loaded on demand via LRU cache (for large datasets).
+      Detected when data_path is a directory with manifest.json or a manifest.json file.
+      DataLoader shuffle / WeightedDistributedSampler randomize global indices,
+      and _resolve_index() maps each to (shard_idx, local_idx) via bisect.
     """
 
     def __init__(self, root, data_path, config, img_aug=False, split="train", verbose=True):
@@ -143,6 +163,19 @@ class CARLA_Data(Dataset):
         self.img_height = config.image_shape[1]
         self.img_width = config.image_shape[2]
 
+        # Dispatch based on data format
+        self._shard_mode = _is_shard_path(data_path)
+        if self._shard_mode:
+            self._init_sharded(data_path, verbose)
+        else:
+            self._init_monolithic(data_path, verbose)
+
+    # ==================================================================
+    # Monolithic loading (original code path)
+    # ==================================================================
+
+    def _init_monolithic(self, data_path, verbose):
+        """Load entire dataset from a single .npy file into memory."""
         self.front_img = []
         self.x = []
         self.y = []
@@ -171,14 +204,14 @@ class CARLA_Data(Dataset):
         self.command = []
         self.only_ap_brake = []
 
-        if self.verbose:
+        if verbose:
             print(f'Load {self.split} data from {data_path}')
         data = np.load(data_path, allow_pickle=True).item()
 
         # Toggle to True if you want to warm-load all images to memory
         self.load_to_memory = False
         if self.load_to_memory:
-            if self.verbose:
+            if verbose:
                 print('load data to memory begin')
             self.progress_bar = tqdm(total=len(data['front_img']), desc="Loading Images")
             threads = []
@@ -197,7 +230,7 @@ class CARLA_Data(Dataset):
             for t in threads:
                 t.join()
             self.progress_bar.close()
-            if self.verbose:
+            if verbose:
                 print('load data to memory end')
 
         # Fill lists
@@ -239,12 +272,105 @@ class CARLA_Data(Dataset):
             for sensor_name in self.sensor_list:
                 if sensor_name in data:
                     self.sensor_images[sensor_name] = data[sensor_name]
-            if self.verbose:
+            if verbose:
                 print(f'Warm-loaded sensors: {list(self.sensor_images.keys())} '
                       f'(size: {data["warm_load_size"]})')
 
         # Sensor metadata (intrinsics/extrinsics, optional)
         self.sensor_meta = data.get('sensor_meta', None)
+
+    # ==================================================================
+    # Sharded loading (lazy, LRU-cached)
+    # ==================================================================
+
+    def _init_sharded(self, data_path, verbose):
+        """Load manifest and build cumulative index for lazy shard loading.
+
+        Instead of loading the entire dataset into memory, we only load
+        per-route .npy files on demand. The DataLoader's shuffle (or
+        WeightedDistributedSampler) generates random global indices;
+        _resolve_index() maps each to the correct (shard, local_idx)
+        via binary search on cumulative offsets.
+
+        Peak RAM per rank ≈ shard_cache_size × avg_route_size (~100MB)
+        instead of the full dataset (~147GB).
+        """
+        if os.path.isdir(data_path):
+            manifest_path = os.path.join(data_path, 'manifest.json')
+            shard_dir = data_path
+        else:
+            manifest_path = data_path
+            shard_dir = os.path.dirname(data_path)
+
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+
+        self._shard_dir = shard_dir
+        self._total_samples = manifest['total_samples']
+
+        # Build cumulative offset array: _shard_offsets[i] = first global index of shard i
+        # _shard_offsets has len(shards)+1 entries (last = total_samples, sentinel)
+        self._shard_files = []
+        self._shard_offsets = []
+        offset = 0
+        for route_info in manifest['routes']:
+            self._shard_files.append(route_info['file'])
+            self._shard_offsets.append(offset)
+            offset += route_info['samples']
+        self._shard_offsets.append(offset)  # sentinel
+
+        # Load buckets for weighted sampling (~84MB for 475k samples — fits easily)
+        buckets_path = os.path.join(shard_dir, '_buckets.npy')
+        self.buckets = np.load(buckets_path) if os.path.exists(buckets_path) else None
+
+        # Warm-load metadata (in shard mode, images are inside individual shard files)
+        self.warm_loaded = manifest.get('warm_load_size') is not None
+        self.sensor_list = manifest.get('sensor_list')
+        self.sensor_meta = manifest.get('sensor_meta')
+        self.sensor_images = {}  # not used in shard mode
+
+        # LRU cache for loaded shards
+        self._shard_cache_size = getattr(self.config, 'shard_cache_size', 20)
+        self._shard_cache = {}
+        self._shard_lru = []  # ordered list for LRU eviction
+
+        # Compatibility attributes (not used in shard mode)
+        self.load_to_memory = False
+
+        if verbose:
+            print(f'Sharded dataset: {len(self._shard_files)} shards, '
+                  f'{self._total_samples} samples, cache_size={self._shard_cache_size}')
+
+    def _resolve_index(self, global_idx):
+        """Map global sample index → (shard_idx, local_idx) via binary search."""
+        shard_idx = bisect.bisect_right(self._shard_offsets, global_idx) - 1
+        local_idx = global_idx - self._shard_offsets[shard_idx]
+        return shard_idx, local_idx
+
+    def _load_shard(self, shard_idx):
+        """Load a shard into the LRU cache, evicting oldest if full."""
+        if shard_idx in self._shard_cache:
+            # Move to most-recently-used position
+            self._shard_lru.remove(shard_idx)
+            self._shard_lru.append(shard_idx)
+            return self._shard_cache[shard_idx]
+
+        # Evict oldest if cache is full
+        while len(self._shard_lru) >= self._shard_cache_size:
+            evict_idx = self._shard_lru.pop(0)
+            del self._shard_cache[evict_idx]
+
+        # Load shard from disk
+        path = os.path.join(self._shard_dir, self._shard_files[shard_idx])
+        shard = np.load(path, allow_pickle=True).item()
+        shard.pop('skipped_nan', None)
+        self._shard_cache[shard_idx] = shard
+        self._shard_lru.append(shard_idx)
+        return shard
+
+    # ==================================================================
+    # Shared interface
+    # ==================================================================
 
     def get_sample_weights(self):
         """Compute per-sample weights from bucket vectors. Returns (N,) float32 array."""
@@ -267,9 +393,20 @@ class CARLA_Data(Dataset):
             self.progress_bar.update(1)
 
     def __len__(self):
+        if self._shard_mode:
+            return self._total_samples
         return len(self.front_img)
 
     def __getitem__(self, index):
+        if self._shard_mode:
+            return self._getitem_sharded(index)
+        return self._getitem_monolithic(index)
+
+    # ==================================================================
+    # __getitem__ — monolithic path (original code)
+    # ==================================================================
+
+    def _getitem_monolithic(self, index):
         data = dict()
 
         # ---------- Load camera views ----------
@@ -327,7 +464,7 @@ class CARLA_Data(Dataset):
         local_command_point_aim = np.array([(self.x_command[index]-ego_x), self.y_command[index]-ego_y])
         local_command_point_aim = R.dot(local_command_point_aim)
         data['target_point'] = local_command_point_aim[:2]
-        
+
         data['speed'] = self.speed[index]
         data['feature'] = self.feature[index]
         data['value'] = self.value[index]
@@ -346,11 +483,88 @@ class CARLA_Data(Dataset):
         assert command in [0, 1, 2, 3, 4, 5]
         cmd_one_hot = [0] * self.config.data_command_class_num
         cmd_one_hot[command] = 1
-        data['target_command'] = torch.tensor(cmd_one_hot)		
+        data['target_command'] = torch.tensor(cmd_one_hot)
 
         self._batch_read_number += 1
 
         return data
+
+    # ==================================================================
+    # __getitem__ — sharded path (lazy loading)
+    # ==================================================================
+
+    def _getitem_sharded(self, index):
+        shard_idx, local_idx = self._resolve_index(index)
+        shard = self._load_shard(shard_idx)
+        data = dict()
+
+        # ---------- Load camera views ----------
+        base_path = shard['front_img'][local_idx][0]
+        if not os.path.exists(base_path):
+            base_path = base_path.replace('v2', 'v2-216')
+
+        resize_dims = (self.img_width, self.img_height)
+        for cam_name in self.data_used:
+            if self.warm_loaded and cam_name in shard:
+                cam_img = self._ensure_pil(shard[cam_name][local_idx])
+            else:
+                cam_path = base_path.replace(self.reference_camera, cam_name)
+                cam_img = np.array(Image.open(cam_path))
+                cam_img = self._ensure_pil(cam_img).resize(resize_dims, Image.BILINEAR)
+            data[cam_name] = cam_img
+
+        # ---------- Normalize like CIL++ ----------
+        if self.split == "train":
+            data = self.train_transform(data, augmentation=self.img_aug)
+        else:
+            data = self.val_transform(data)
+
+        # Waypoints (same ego-frame transform as monolithic path)
+        ego_x = shard['input_x'][local_idx][0]
+        ego_y = shard['input_y'][local_idx][0]
+        ego_theta = shard['input_theta'][local_idx][0] - np.pi / 2
+        R = np.array([
+            [np.cos(ego_theta), np.sin(ego_theta)],
+            [-np.sin(ego_theta), np.cos(ego_theta)]
+        ])
+        waypoints = []
+        for i in range(8):
+            lp = np.array([shard['future_x'][local_idx][i] - ego_x,
+                           shard['future_y'][local_idx][i] - ego_y])
+            waypoints.append(R.dot(lp))
+        data['waypoints'] = np.array(waypoints)
+
+        if getattr(self.config, 'mask_loss_enabled', False):
+            data['waypoint_mask'] = torch.from_numpy(
+                generate_waypoint_mask(data['waypoints'], self.config)
+            )
+
+        data['action'] = shard['action'][local_idx]
+        data['action_index'] = shard['action_index'][local_idx]
+        data['future_action_index'] = shard['future_action_index'][local_idx]
+        data['future_feature'] = shard['future_feature'][local_idx]
+
+        local_aim = np.array([shard['x_target'][local_idx] - ego_x,
+                              shard['y_target'][local_idx] - ego_y])
+        data['target_point'] = R.dot(local_aim)[:2]
+
+        data['speed'] = shard['speed'][local_idx]
+        data['feature'] = shard['feature'][local_idx]
+        data['value'] = shard['value'][local_idx]
+
+        command = shard['target_command'][local_idx]
+        if command < 0:
+            command = 4
+        command -= 1
+        assert command in [0, 1, 2, 3, 4, 5]
+        cmd_one_hot = [0] * self.config.data_command_class_num
+        cmd_one_hot[command] = 1
+        data['target_command'] = torch.tensor(cmd_one_hot)
+
+        self._batch_read_number += 1
+
+        return data
+
     ###############################
     #          HELPERS
     ###############################

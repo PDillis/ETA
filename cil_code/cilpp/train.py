@@ -247,8 +247,8 @@ class CILppPlanner(pl.LightningModule):
 
 @click.command()
 # Required.
-@click.option('--train-data',      help='Training data file (.npy)', metavar='PATH',            type=click.Path(exists=True), default=os.getenv('TRAIN_DATA_PATH'))
-@click.option('--val-data',        help='Validation data file (.npy)', metavar='PATH',          type=click.Path(exists=True), default=os.getenv('VAL_DATA_PATH'))
+@click.option('--train-data',      help='Training data (.npy file or shard directory)', metavar='PATH', type=click.Path(exists=True), default=os.getenv('TRAIN_DATA_PATH'))
+@click.option('--val-data',        help='Validation data (.npy file or shard directory)', metavar='PATH', type=click.Path(exists=True), default=os.getenv('VAL_DATA_PATH'))
 # Optional features.
 @click.option('--data-root',       help='Dataset root direct0ory (images)', metavar='DIR',      type=click.Path(exists=True), default=os.getenv('BENCH2DRIVE_ROOT'))
 @click.option('--cameras',         help='Comma-separated camera names', metavar='STR',          type=str, default=None)

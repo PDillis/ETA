@@ -627,6 +627,60 @@ def run_rich_display(progress_queue: mp.Queue, num_workers: int, group_counts: D
 
 
 ############################################################
+# Manifest (for lazy shard loading)
+############################################################
+
+def write_manifest(staging_dir, manifest_path, sensor_list=None, sensor_meta=None,
+                   warm_load=False, warm_load_size=None):
+    """Write manifest.json with shard file info, sample counts, and bucket vectors.
+
+    The manifest enables lazy shard loading: instead of one giant merged .npy,
+    data.py reads per-route .npy files on demand via an LRU cache.
+    Bucket vectors are saved separately as _buckets.npy (needed for weighted sampling).
+    """
+    route_files = sorted(f for f in os.listdir(staging_dir)
+                         if f.endswith('.npy') and not f.startswith('_'))
+
+    routes = []
+    all_buckets = []
+    total_samples = 0
+    total_skipped = 0
+
+    for rf in route_files:
+        d = np.load(os.path.join(staging_dir, rf), allow_pickle=True).item()
+        n = len(d['front_img'])
+        total_samples += n
+        total_skipped += d.get('skipped_nan', 0)
+        routes.append({'file': rf, 'samples': n})
+        if 'buckets' in d:
+            all_buckets.extend(d['buckets'])
+        del d
+
+    manifest = {
+        'total_samples': total_samples,
+        'total_skipped_nan': total_skipped,
+        'routes': routes,
+        'bucket_names': BUCKET_NAMES,
+        'sensor_list': sensor_list,
+        'sensor_meta': sensor_meta,
+        'warm_load_size': warm_load_size if warm_load else None,
+    }
+
+    # Save buckets separately (needed for weighted sampling, but too large for JSON)
+    if all_buckets:
+        np.save(os.path.join(staging_dir, '_buckets.npy'),
+                np.array(all_buckets, dtype=np.float64))
+
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest, f, indent=2)
+
+    console.print(f'[green]Wrote manifest: {manifest_path}[/green]')
+    console.print(f'[green]  {len(routes)} shards, {total_samples} total samples[/green]')
+    if total_skipped:
+        console.print(f'[yellow]  {total_skipped} NaN/Inf skipped[/yellow]')
+
+
+############################################################
 # Chunked tree-reduce merge
 ############################################################
 
@@ -768,7 +822,8 @@ def aggregate_and_save(staging_dir: str, output_path: str,
 @click.option('--warm-load/--no-warm-load', help='Store resized image arrays in .npy', default=False, show_default=True)
 @click.option('--img-size', help='Resize images to HxW during warm-load', type=str, default='300x300', show_default=True)
 @click.option('--merge-chunk-size', help='Routes per merge chunk (lower = less RAM)', type=int, default=50, show_default=True)
-def main(config, dataset_root, name, output, is_train, input_fps, output_fps, input_frames, future_frames, val_routes, dataset_format, num_workers, cameras, sensor_types, additional_sensors, warm_load, img_size, merge_chunk_size):
+@click.option('--keep-shards/--no-keep-shards', help='Keep per-route shards + manifest for lazy loading (skip merge)', default=True, show_default=True)
+def main(config, dataset_root, name, output, is_train, input_fps, output_fps, input_frames, future_frames, val_routes, dataset_format, num_workers, cameras, sensor_types, additional_sensors, warm_load, img_size, merge_chunk_size, keep_shards):
     """
     Generate .npy training/validation data with configurable parameters.
 
@@ -945,20 +1000,34 @@ def main(config, dataset_root, name, output, is_train, input_fps, output_fps, in
     else:
         console.print('[green]All routes already processed. Proceeding to merge.[/green]')
 
-    # Merge all per-route .npy files into the final output (chunked tree-reduce)
-    aggregate_and_save(
-        staging_dir, output,
-        chunk_size=merge_chunk_size,
-        num_workers=num_workers,
+    # Always write manifest (enables lazy shard loading)
+    manifest_path = os.path.join(staging_dir, 'manifest.json')
+    write_manifest(
+        staging_dir, manifest_path,
         sensor_list=sensor_list,
         sensor_meta=sensor_meta,
         warm_load=warm_load,
         warm_load_size=[img_h, img_w] if warm_load else None,
     )
 
-    # Clean up staging directory after successful merge
-    shutil.rmtree(staging_dir)
-    console.print(f'[dim]Cleaned up staging directory: {staging_dir}[/dim]')
+    if keep_shards:
+        console.print(f'\n[bold green]Shards kept in {staging_dir}[/bold green]')
+        console.print(f'[cyan]For training, use:[/cyan]  --train-data {staging_dir}')
+    else:
+        # Merge all per-route .npy files into the final output (chunked tree-reduce)
+        aggregate_and_save(
+            staging_dir, output,
+            chunk_size=merge_chunk_size,
+            num_workers=num_workers,
+            sensor_list=sensor_list,
+            sensor_meta=sensor_meta,
+            warm_load=warm_load,
+            warm_load_size=[img_h, img_w] if warm_load else None,
+        )
+
+        # Clean up staging directory after successful merge
+        shutil.rmtree(staging_dir)
+        console.print(f'[dim]Cleaned up staging directory: {staging_dir}[/dim]')
 
 
 if __name__ == '__main__':
