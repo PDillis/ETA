@@ -626,59 +626,127 @@ def run_rich_display(progress_queue: mp.Queue, num_workers: int, group_counts: D
                 done_workers += 1
 
 
+############################################################
+# Chunked tree-reduce merge
+############################################################
+
+# Keys present in every per-route .npy (used to initialize merge dicts)
+MERGE_KEYS = [
+    'future_x', 'future_y', 'future_theta',
+    'future_feature', 'future_action', 'future_action_index', 'future_only_ap_brake',
+    'future_acceleration', 'future_angular_velocity',
+    'input_x', 'input_y', 'input_theta',
+    'front_img', 'feature', 'value', 'speed',
+    'action', 'action_index',
+    'x_target', 'y_target', 'target_command',
+    'only_ap_brake',
+    'acceleration',
+    'angular_velocity',
+    'buckets',
+]
+
+
+def merge_chunk(args):
+    """Merge a list of .npy files into one output .npy. Picklable for Pool.map."""
+    input_files, output_path, extra_keys = args
+    merged = {k: [] for k in MERGE_KEYS}
+    for k in (extra_keys or []):
+        merged[k] = []
+
+    skipped = 0
+    for f in input_files:
+        d = np.load(f, allow_pickle=True).item()
+        skipped += d.pop('skipped_nan', 0)
+        for key in merged:
+            if key in d:
+                merged[key].extend(d[key])
+        del d
+
+    merged['skipped_nan'] = skipped
+    np.save(output_path, merged)
+    del merged
+    return output_path
+
+
 def aggregate_and_save(staging_dir: str, output_path: str,
+                       chunk_size: int = 50, num_workers: int = 8,
                        sensor_list: Optional[List[str]] = None,
                        sensor_meta: Optional[Dict] = None,
                        warm_load: bool = False,
                        warm_load_size: Optional[List[int]] = None):
-    """Merge per-route .npy files from staging_dir into a single output .npy."""
-    route_files = sorted(glob.glob(os.path.join(staging_dir, '*.npy')))
-    console.print(f'\n[bold]Merging {len(route_files)} route files...[/bold]')
+    """
+    Merge per-route .npy files using a chunked tree-reduce pattern.
 
-    total_data = {
-        'future_x': [], 'future_y': [], 'future_theta': [],
-        'future_feature': [], 'future_action': [], 'future_action_index': [], 'future_only_ap_brake': [],
-        'future_acceleration': [], 'future_angular_velocity': [],
-        'input_x': [], 'input_y': [], 'input_theta': [],
-        'front_img': [], 'feature': [], 'value': [], 'speed': [],
-        'action': [], 'action_index': [],
-        'x_target': [], 'y_target': [], 'target_command': [],
-        'only_ap_brake': [],
-        'acceleration': [],
-        'angular_velocity': [],
-        'buckets': [],
-    }
+    Instead of loading all routes into one giant dict (OOM), merges N routes
+    at a time into intermediate files, then recursively merges intermediates.
+    Peak memory at any step ≈ chunk_size × avg_route_size.
+    """
+    # Collect route files (exclude _merge intermediates from previous failed runs)
+    route_files = sorted(f for f in glob.glob(os.path.join(staging_dir, '*.npy'))
+                         if not os.path.basename(f).startswith('_merge_'))
 
-    # Add per-sensor keys when warm-loading
-    if warm_load and sensor_list:
-        for sensor in sensor_list:
-            total_data[sensor] = []
+    if not route_files:
+        console.print('[red]No route files found in staging directory![/red]')
+        return
 
-    _skipped_nan_total = 0
+    console.print(f'\n[bold]Merging {len(route_files)} route files '
+                  f'(chunk_size={chunk_size}, workers={num_workers})...[/bold]')
 
-    for route_file in route_files:
-        seq_data = np.load(route_file, allow_pickle=True).item()
-        _skipped_nan_total += seq_data.pop('skipped_nan', 0)
+    extra_keys = list(sensor_list) if (warm_load and sensor_list) else []
 
-        for key in total_data.keys():
-            if key in seq_data:
-                total_data[key].extend(seq_data[key])
-        del seq_data  # free memory immediately
+    current_files = route_files
+    level = 0
 
-    total_data['bucket_names'] = BUCKET_NAMES
+    while len(current_files) > chunk_size:
+        # Split into chunks
+        chunks = [current_files[i:i + chunk_size]
+                  for i in range(0, len(current_files), chunk_size)]
 
-    # Sensor metadata (always stored for provenance)
+        # Build merge tasks: (input_files, output_path, extra_keys)
+        tasks = []
+        next_files = []
+        for j, chunk in enumerate(chunks):
+            if len(chunk) == 1:
+                next_files.append(chunk[0])
+                continue
+            intermediate = os.path.join(staging_dir, f'_merge_L{level}_{j}.npy')
+            tasks.append((chunk, intermediate, extra_keys))
+            next_files.append(intermediate)
+
+        # Merge chunks in parallel
+        if tasks:
+            n_pool = min(num_workers, len(tasks))
+            console.print(f'  Level {level}: {len(chunks)} chunks, '
+                          f'{len(tasks)} merges ({n_pool} workers)')
+            with mp.Pool(n_pool) as pool:
+                pool.map(merge_chunk, tasks)
+
+        current_files = next_files
+        level += 1
+
+    # Final merge: remaining files fit in one chunk
+    console.print(f'  Final merge: {len(current_files)} files → {output_path}')
+    merge_chunk((current_files, output_path, extra_keys))
+
+    # Re-load final file to add metadata (small overhead — just re-saving with extra keys)
+    final = np.load(output_path, allow_pickle=True).item()
+    skipped_total = final.pop('skipped_nan', 0)
+    final['bucket_names'] = BUCKET_NAMES
     if sensor_list:
-        total_data['sensor_list'] = sensor_list
+        final['sensor_list'] = sensor_list
     if sensor_meta:
-        total_data['sensor_meta'] = sensor_meta
-    total_data['warm_load_size'] = warm_load_size if warm_load else None
+        final['sensor_meta'] = sensor_meta
+    final['warm_load_size'] = warm_load_size if warm_load else None
+    np.save(output_path, final)
 
-    np.save(output_path, total_data)
-    console.print(f'[green]Saved {len(total_data["front_img"])} sequences to {output_path}[/green]')
+    console.print(f'[green]Saved {len(final["front_img"])} sequences to {output_path}[/green]')
     if warm_load and sensor_list:
         console.print(f'[green]Warm-loaded sensors: {sensor_list}[/green]')
-    console.print(f'[yellow]Total sequences skipped due to NaN/Inf: {_skipped_nan_total}[/yellow]')
+    console.print(f'[yellow]Total NaN/Inf skipped: {skipped_total}[/yellow]')
+
+    # Clean up intermediates from this run
+    for f in glob.glob(os.path.join(staging_dir, '_merge_*.npy')):
+        os.remove(f)
 
 
 @click.command()
@@ -699,7 +767,8 @@ def aggregate_and_save(staging_dir: str, output_path: str,
 @click.option('--additional-sensors', help='Non-camera sensors (comma-sep), e.g. lidar,radar', type=str, default=None)
 @click.option('--warm-load/--no-warm-load', help='Store resized image arrays in .npy', default=False, show_default=True)
 @click.option('--img-size', help='Resize images to HxW during warm-load', type=str, default='300x300', show_default=True)
-def main(config, dataset_root, name, output, is_train, input_fps, output_fps, input_frames, future_frames, val_routes, dataset_format, num_workers, cameras, sensor_types, additional_sensors, warm_load, img_size):
+@click.option('--merge-chunk-size', help='Routes per merge chunk (lower = less RAM)', type=int, default=50, show_default=True)
+def main(config, dataset_root, name, output, is_train, input_fps, output_fps, input_frames, future_frames, val_routes, dataset_format, num_workers, cameras, sensor_types, additional_sensors, warm_load, img_size, merge_chunk_size):
     """
     Generate .npy training/validation data with configurable parameters.
 
@@ -876,9 +945,11 @@ def main(config, dataset_root, name, output, is_train, input_fps, output_fps, in
     else:
         console.print('[green]All routes already processed. Proceeding to merge.[/green]')
 
-    # Merge all per-route .npy files into the final output
+    # Merge all per-route .npy files into the final output (chunked tree-reduce)
     aggregate_and_save(
         staging_dir, output,
+        chunk_size=merge_chunk_size,
+        num_workers=num_workers,
         sensor_list=sensor_list,
         sensor_meta=sensor_meta,
         warm_load=warm_load,
